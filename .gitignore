@@ -20,6 +20,9 @@ go.work.sum
 # Local Go build cache (used when the global cache is not writable)
 .gocache/
 
+# Local snapshots taken before edits
+.dsh-backup/
+
 # Local env & logs
 .env
 *.log
