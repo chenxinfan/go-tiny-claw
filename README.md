@@ -2,7 +2,7 @@
 
 跟着极客时间《从 0 开始构建 Agent Harness》课程，用 Go 手写一个迷你 Agent Harness（对标 Claude Code）。
 
-当前进度：**第 04 章 · 接入真实大模型（本项目用 DeepSeek）**。
+当前进度：**第 05 章 · 真实工具与工具注册表**。
 
 ## 章节进度
 
@@ -12,6 +12,7 @@
 | 02 | 四个核心接口 + 两轮 ReAct 循环（Mock 模型/工具） | ✅ |
 | 03 | 每轮拆成 Thinking / Action 两阶段 | ✅ |
 | 04 | 真实模型接入：Claude / OpenAI 兼容 Provider + 真实工具调用 | ✅（本项目用 DeepSeek） |
+| 05 | 真实工具：`BaseTool` 接口 + 可注册的 Registry + `read_file` | ✅ |
 
 ## 第 01 章 · 工程骨架
 
@@ -65,13 +66,35 @@ llmProvider := provider.NewDeepSeekProvider("deepseek-chat")
 > 「OpenAI/Zhipu」字样保持原样未改；本项目实际调用 DeepSeek 时，报错前缀会显示成
 > 「OpenAI/Zhipu API 请求失败」，这是共用代码路径导致的，不是接错了。
 
+## 第 05 章 · 真实工具与工具注册表
+
+第 04 章的工具还是 `main.go` 里手写的 `mockRegistry`；这一章把它换成真正的工具系统：
+
+| 文件 | 内容 |
+| --- | --- |
+| `internal/tools/registry.go` | `BaseTool` 接口（`Name()` / `Definition()` / `Execute()`）+ `Registry` 接口 + `registryImpl`（map 存工具，按名字派发） |
+| `internal/tools/read_file.go` | 第一个真实工具：按相对路径读文件，超过 8000 字节自动截断 |
+| `hello.txt` | 给 `read_file` 用的测试文件 |
+
+关键设计是**工具自己声明自己**：每个工具提供 `Definition()` 返回 JSON Schema，Registry 收集起来喂给模型，
+模型按 schema 填参数，Registry 再按 `call.Name` 找回对应工具执行。这样加新工具只需要写一个 struct + 一行
+`registry.Register(...)`，不用改 engine 和 provider。
+
+`main.go` 里也从 `mockRegistry` 换成了：
+
+```go
+registry := tools.NewRegistry()
+registry.Register(tools.NewReadFileTool(workDir))
+```
+
 ## 目录结构
 
 ```
 go-tiny-claw/
 ├── .env.example                  # 环境变量模板，复制成 .env 使用（.env 已被忽略）
+├── hello.txt                     # read_file 工具的测试文本
 ├── go.mod / go.sum               # 带 anthropic-sdk-go、openai-go/v3 依赖
-├── cmd/claw/main.go              # 用 DeepSeek Provider + mock 天气工具驱动循环
+├── cmd/claw/main.go              # 用 DeepSeek Provider + 真实工具注册表驱动循环
 └── internal/
     ├── config/dotenv.go          # 极简 .env 加载器（本项目新增，无第三方依赖）
     ├── engine/loop.go            # 两阶段 ReAct 循环
@@ -81,7 +104,9 @@ go-tiny-claw/
     │   ├── openai.go             # OpenAI 兼容实现（课程原版 + 智谱构造器）
     │   └── deepseek.go           # DeepSeek 构造器（本项目新增）
     ├── schema/message.go
-    └── tools/registry.go
+    └── tools/
+        ├── registry.go           # BaseTool / Registry / registryImpl
+        └── read_file.go          # 读取文件工具
 ```
 
 ## 运行
@@ -132,8 +157,19 @@ go vet ./...
 go run ./cmd/claw
 ```
 
-预期：模型先请求 `get_weather(city=北京)`，引擎执行 mock 工具后把结果回填，模型再给出结论，
-然后因为没有新的工具调用而退出。每一次工具调用都会打印 `-> 🛠️ 执行工具: get_weather, 参数: {"city":"北京"}`。
+预期：模型先请求 `read_file(path=hello.txt)`，Registry 派发给真实文件工具读取 `hello.txt`，
+结果回填后模型用一句话总结，然后因为没有新的工具调用而退出：
+
+```
+[Registry] 成功挂载工具: read_file
+========== [Turn 1] 开始 ==========
+[Engine] 模型请求调用 1 个工具...
+  -> 🛠️ 执行工具: read_file, 参数: {"path": "hello.txt"}
+  -> ✅ 工具执行成功 (返回 120 字节)
+========== [Turn 2] 开始 ==========
+🤖 [对外回复]: 文件内容是一句问候：它自称是来自物理文件系统的一段"神秘文本"……
+[Engine] 模型未请求调用工具，任务宣告完成。
+```
 
 ### Go 版本
 
@@ -181,5 +217,5 @@ Phase 1 用 `Generate(ctx, history, nil)` 把工具清空，模型只能输出�
 
 ## 下一章
 
-第 05 章上真实工具：新增 `internal/tools/read_file.go`，`registry.go` 从纯接口变成可注册的工具注册表，
-`main.go` 里的 mock 会被真实工具替换。
+第 06 章补齐工具集：新增 `internal/tools/bash.go`、`internal/tools/write_file.go`，
+把「读 / 写 / 执行命令」三件套都注册进去，Agent 才算真的能动手。
