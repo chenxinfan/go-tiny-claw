@@ -2,7 +2,7 @@
 
 跟着极客时间《从 0 开始构建 Agent Harness》课程，用 Go 手写一个迷你 Agent Harness（对标 Claude Code）。
 
-当前进度：**第 05 章 · 真实工具与工具注册表**。
+当前进度：**第 07 章 · edit_file：局部替换与模糊匹配**。
 
 ## 章节进度
 
@@ -13,6 +13,8 @@
 | 03 | 每轮拆成 Thinking / Action 两阶段 | ✅ |
 | 04 | 真实模型接入：Claude / OpenAI 兼容 Provider + 真实工具调用 | ✅（本项目用 DeepSeek） |
 | 05 | 真实工具：`BaseTool` 接口 + 可注册的 Registry + `read_file` | ✅ |
+| 06 | 工具集补齐：`write_file` + `bash`，Agent 能真改文件、真跑命令 | ✅（Windows 适配） |
+| 07 | `edit_file`：按 old_text 做局部替换，四层模糊匹配兜底 | ✅ |
 
 ## 第 01 章 · 工程骨架
 
@@ -87,14 +89,81 @@ registry := tools.NewRegistry()
 registry.Register(tools.NewReadFileTool(workDir))
 ```
 
+## 第 06 章 · 读 / 写 / 执行三件套
+
+第 05 章只有一只「眼睛」，这一章把「手」也装上：
+
+| 工具 | 文件 | 能力 |
+| --- | --- | --- |
+| `read_file` | `internal/tools/read_file.go` | 按相对路径读文件，8000 字节截断 |
+| `write_file` | `internal/tools/write_file.go` | 创建/覆盖文件，父目录自动创建 |
+| `bash` | `internal/tools/bash.go` | 在工作区执行命令，30s 超时，output 8000 字节截断 |
+
+`main.go` 里三行注册：
+
+```go
+registry.Register(tools.NewReadFileTool(workDir))
+registry.Register(tools.NewWriteFileTool(workDir))
+registry.Register(tools.NewBashTool(workDir))
+```
+
+课程示例任务就是端到端验证：查 Go 版本 → 写 `helloworld.go` → 编译运行。四轮循环、三次工具调用，
+全程无需人工干预。
+
+### Windows 适配（课程原版是 `bash -c`）
+
+课程原文用 `exec.Command("bash", "-c", cmd)`，在 Windows 上不一定有 bash，而且中文输出会乱码。
+本项目按平台分流：
+
+```go
+if runtime.GOOS == "windows" {
+    return exec.CommandContext(ctx, "cmd", "/c", "chcp 65001>nul & "+command)
+}
+return exec.CommandContext(ctx, "bash", "-c", command)
+```
+
+两个细节：
+
+1. **用 `cmd.exe` 而不是 PowerShell**：`cmd` 支持 `&&` 链式命令，和课程描述一致；PowerShell 5.1 不支持；
+2. **先 `chcp 65001`**：把子进程控制台切到 UTF-8，否则 `dir` 之类命令输出的中文会变成乱码。
+
+工具的 `Description()` 也会按平台提示模型（Windows 下说「用 dir/type，不要用 ls/cat」），
+避免模型写出平台不兼容的命令——这是 harness 在给模型「喂环境信息」的又一个例子。
+
+## 第 07 章 · edit_file：让 Agent 安全地改代码
+
+`write_file` 是整文件覆盖，让 Agent 改代码很危险：模型只见过文件的一部分，重写整份就会丢掉它没看见的内容。
+`edit_file` 用「旧串 → 新串」的局部替换解决这个问题：
+
+```json
+{"path": "server.go", "old_text": "\tif true {...}", "new_text": "\tif user == nil {...}"}
+```
+
+难点在于**模型给出的 `old_text` 往往和文件里的字节不完全一致**（缩进、换行、首尾空白）。
+所以 `fuzzyReplace` 做了四层降级匹配：
+
+| 层级 | 策略 | 适用场景 |
+| --- | --- | --- |
+| L1 | 精确 `strings.Count` | 完全一致，最理想 |
+| L2 | CRLF → LF 归一化 | **Windows 检出文件带 `\r\n`，模型传 `\n`** |
+| L3 | 去掉首尾空白再匹配 | 模型漏了开头/结尾的空行 |
+| L4 | 逐行比较、忽略每行缩进 | 模型把 tab 写成了空格 |
+
+任何一层都要求**恰好命中一处**：命中 0 处报「未找到」，命中多处报「请提供更多上下文」。
+这个「唯一性约束」很关键——如果模型给的片段在文件里出现两次，宁可失败也不要乱改。
+
+L2 那层在 Windows 上尤其重要：本仓库 `core.autocrlf=true`，检出的文件是 CRLF，
+而模型在 JSON 里写的换行是 `\n`，不归一化就永远匹配不上。
+
 ## 目录结构
 
 ```
 go-tiny-claw/
 ├── .env.example                  # 环境变量模板，复制成 .env 使用（.env 已被忽略）
-├── hello.txt                     # read_file 工具的测试文本
+├── hello.txt                     # read_file 的测试文本（第 05 章）
+├── server.go                     # edit_file 的测试文件（第 07 章）
 ├── go.mod / go.sum               # 带 anthropic-sdk-go、openai-go/v3 依赖
-├── cmd/claw/main.go              # 用 DeepSeek Provider + 真实工具注册表驱动循环
+├── cmd/claw/main.go              # 用 DeepSeek Provider + 四件套工具驱动循环
 └── internal/
     ├── config/dotenv.go          # 极简 .env 加载器（本项目新增，无第三方依赖）
     ├── engine/loop.go            # 两阶段 ReAct 循环
@@ -106,7 +175,10 @@ go-tiny-claw/
     ├── schema/message.go
     └── tools/
         ├── registry.go           # BaseTool / Registry / registryImpl
-        └── read_file.go          # 读取文件工具
+        ├── read_file.go          # 读文件
+        ├── write_file.go         # 写文件
+        ├── bash.go               # 执行命令（Windows 走 cmd.exe）
+        └── edit_file.go          # 局部替换 + 四层模糊匹配
 ```
 
 ## 运行
@@ -157,19 +229,30 @@ go vet ./...
 go run ./cmd/claw
 ```
 
-预期：模型先请求 `read_file(path=hello.txt)`，Registry 派发给真实文件工具读取 `hello.txt`，
-结果回填后模型用一句话总结，然后因为没有新的工具调用而退出：
+预期：模型先 `read_file` 看清 `server.go`，再用 `edit_file` 替换 if 块，再 `read_file` 复核，
+最后给出总结（四轮、三次工具调用）：
 
 ```
 [Registry] 成功挂载工具: read_file
+[Registry] 成功挂载工具: write_file
+[Registry] 成功挂载工具: bash
+[Registry] 成功挂载工具: edit_file
 ========== [Turn 1] 开始 ==========
-[Engine] 模型请求调用 1 个工具...
-  -> 🛠️ 执行工具: read_file, 参数: {"path": "hello.txt"}
-  -> ✅ 工具执行成功 (返回 120 字节)
+🤖 [对外回复]: 我先读取一下 server.go 文件内容。
+  -> 🛠️ 执行工具: read_file, 参数: {"path": "server.go"}
 ========== [Turn 2] 开始 ==========
-🤖 [对外回复]: 文件内容是一句问候：它自称是来自物理文件系统的一段"神秘文本"……
+🤖 [对外回复]: 现在替换那个 if 语句。
+  -> 🛠️ 执行工具: edit_file, 参数: {"path": "server.go", "old_text": "...", "new_text": "..."}
+  -> ✅ 工具执行成功 (返回 33 字节)
+========== [Turn 3] 开始 ==========
+  -> 🛠️ 执行工具: read_file, 参数: {"path": "server.go"}
+========== [Turn 4] 开始 ==========
+🤖 [对外回复]: 已完成替换……（并提醒 user 变量未定义，当前无法编译）
 [Engine] 模型未请求调用工具，任务宣告完成。
 ```
+
+> 这个 demo 会真的改写 `server.go`。跑完想复原：`git checkout -- server.go`。
+> 注意改完的文件引用了未定义的 `user`，`go build ./...` 会失败，这是课程示例的预期结果，不是 bug。
 
 ### Go 版本
 
@@ -217,5 +300,5 @@ Phase 1 用 `Generate(ctx, history, nil)` 把工具清空，模型只能输出�
 
 ## 下一章
 
-第 06 章补齐工具集：新增 `internal/tools/bash.go`、`internal/tools/write_file.go`，
-把「读 / 写 / 执行命令」三件套都注册进去，Agent 才算真的能动手。
+第 08 章开始动 engine 核心：`loop.go` 会从 3118 字节涨到 3571 字节（引出上下文/轮次控制），
+同时新增 `a.txt`、`b.txt`、`c.txt` 三个夹具文件配合演示。

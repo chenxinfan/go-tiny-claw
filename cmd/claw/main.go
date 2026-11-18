@@ -39,15 +39,25 @@ func main() {
 
 	llmProvider := provider.NewDeepSeekProvider(model)
 
-	// 第 05 章：工具注册表从「接口 + mock」变成真的注册表，挂上 read_file。
+	// 第 07 章：补上 edit_file（局部替换），四个工具组成完整的读写改执行能力。
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewReadFileTool(workDir))
+	registry.Register(tools.NewWriteFileTool(workDir))
+	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewEditFileTool(workDir))
 
 	// 慢思考模式默认关闭：DeepSeek 在 Phase 1（无工具）会把工具调用意图吐成
 	// <tool_call> / DSML 这种原始文本，既费 token 又干扰阅读。想体验就改成 true。
 	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
 
-	prompt := "请调用工具读取一下当前工作区目录下 hello.txt 文件的内容，并用一句话向我总结它说了什么。"
+	prompt := `
+	我当前目录下有一个 server.go 文件。
+	请帮我把里面 "TODO: 增加鉴权逻辑" 下面的那个 if 语句，整个替换为：
+	if user == nil {
+		fmt.Println("Forbidden!")
+		return
+	}
+	`
 
 	err := eng.Run(context.Background(), prompt)
 	if err != nil {
