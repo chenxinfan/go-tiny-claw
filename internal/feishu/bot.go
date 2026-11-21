@@ -10,6 +10,7 @@ import (
 
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 	"github.com/yourname/go-tiny-claw/internal/engine"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -40,8 +41,24 @@ func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
 	}
 }
 
+// GetEventDispatcher 用于 Webhook 模式：按开放平台的加密策略决定是否解密事件信封。
 func (b *FeishuBot) GetEventDispatcher() *dispatcher.EventDispatcher {
-	encryptKey := os.Getenv("FEISHU_ENCRYPT_KEY")
+	return b.buildDispatcher(os.Getenv("FEISHU_ENCRYPT_KEY"))
+}
+
+// GetLongConnDispatcher 用于长连接模式：事件走 WebSocket 帧，不再有加密信封，
+// 所以 encryptKey 必须传空，否则 dispatcher 会去找 body 里的 "encrypt" 字段并报错。
+func (b *FeishuBot) GetLongConnDispatcher() *dispatcher.EventDispatcher {
+	return b.buildDispatcher("")
+}
+
+// StartLongConnection 用 WebSocket 长连接接收事件，不需要公网回调地址，也不需要 URL 校验。
+func (b *FeishuBot) StartLongConnection(ctx context.Context) error {
+	cli := larkws.NewClient(b.appID, b.appSecret, larkws.WithEventHandler(b.GetLongConnDispatcher()))
+	return cli.Start(ctx)
+}
+
+func (b *FeishuBot) buildDispatcher(encryptKey string) *dispatcher.EventDispatcher {
 	verifyToken := os.Getenv("FEISHU_VERIFY_TOKEN")
 
 	handler := dispatcher.NewEventDispatcher(verifyToken, encryptKey).

@@ -49,13 +49,29 @@ func main() {
 	// 慢思考默认关闭（DeepSeek 在无工具阶段会吐 <tool_call> 文本）。
 	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
 
-	// 有飞书凭证就走 Webhook 服务模式（课程原版行为），否则本地命令行跑一个 demo。
+	// 有飞书凭证就走飞书模式，否则本地命令行跑一个 demo。
+	// 飞书模式默认用「长连接」(WebSocket)：本地开发不需要公网回调地址，
+	// 也不需要在开放平台做 URL 校验。设 FEISHU_MODE=webhook 则回到课程的 HTTP 服务模式。
 	if os.Getenv("FEISHU_APP_ID") != "" {
-		runFeishuServer(eng)
+		if os.Getenv("FEISHU_MODE") == "webhook" {
+			runFeishuServer(eng)
+		} else {
+			runFeishuLongConnection(eng)
+		}
 		return
 	}
 
 	runConsoleDemo(eng)
+}
+
+// runFeishuLongConnection 用 WebSocket 长连接收事件，适合本机 / 内网开发。
+func runFeishuLongConnection(eng *engine.AgentEngine) {
+	bot := feishu.NewFeishuBot(eng)
+	log.Println("🚀 go-tiny-claw 已通过飞书长连接启动，请在飞书里给机器人发消息")
+
+	if err := bot.StartLongConnection(context.Background()); err != nil {
+		log.Fatalf("长连接启动失败: %v", err)
+	}
 }
 
 // runFeishuServer 是课程第 09 章的主体：起一个 HTTP 服务接飞书事件回调。

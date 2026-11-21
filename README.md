@@ -217,23 +217,45 @@ engine 的每个回调再通过飞书 OpenAPI 发消息回群。
 
 ### 本项目的入口设计
 
-课程 `main.go` 直接把 CLI demo 换成了飞书服务端。本项目做成了双模式，方便没有飞书凭证时也能跑：
+课程 `main.go` 直接把 CLI demo 换成了飞书服务端。本项目做成了三模式：
 
 ```go
 if os.Getenv("FEISHU_APP_ID") != "" {
-    runFeishuServer(eng)   // 课程原版：起 webhook 服务
+    if os.Getenv("FEISHU_MODE") == "webhook" {
+        runFeishuServer(eng)        // 课程原版：HTTP 回调，需要公网可达地址
+    } else {
+        runFeishuLongConnection(eng) // 默认：WebSocket 长连接，本地就能用
+    }
     return
 }
-runConsoleDemo(eng)        // 本地：同一个 engine + 终端 Reporter
+runConsoleDemo(eng)                  // 本地命令行 demo
 ```
 
-要接飞书，在 `.env` 里补四个变量即可：
+### 为什么默认走长连接
+
+飞书开放平台那套「请求地址」回调要求**公网可访问**（本地 `192.168.1.x` 飞书云端根本拨不过来），
+而且平台校验时会发一个 `url_verification` challenge，服务端必须回合法 JSON，否则就报
+「返回数据不是合法的JSON格式」。还有一层坑：如果 `.env` 配了 `FEISHU_ENCRYPT_KEY`，dispatcher 会
+要求事件体是 `{"encrypt": "..."}` 加密信封，明文 challenge 会直接 500
+（`event unmarshal failed,encrypted message is blank`）。
+
+长连接（WebSocket）把这些问题一次绕开：**不需要公网地址、不需要 URL 校验、不涉及信封加密**。
+本机实测能连上：
 
 ```
+[Info] connected to wss://msg-frontier.feishu.cn/ws/v2?...
+```
+
+用法：开放平台「事件与回调 → 订阅方式」选「使用长连接接收回调」，然后直接运行程序。
+
+要接飞书，在 `.env` 里补：
+
+```
+FEISHU_MODE=ws              # 默认值，可省略；设 webhook 才走 HTTP 服务
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
-FEISHU_VERIFY_TOKEN=xxx
-FEISHU_ENCRYPT_KEY=xxx
+FEISHU_VERIFY_TOKEN=xxx     # 仅 webhook 模式需要
+FEISHU_ENCRYPT_KEY=xxx      # 仅 webhook 模式需要，且必须与平台加密策略一致
 ```
 
 ## 目录结构
