@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 
+	"github.com/larksuite/oapi-sdk-go/v3/core/httpserverext"
 	"github.com/yourname/go-tiny-claw/internal/config"
 	"github.com/yourname/go-tiny-claw/internal/engine"
+	"github.com/yourname/go-tiny-claw/internal/feishu"
 	"github.com/yourname/go-tiny-claw/internal/provider"
 	"github.com/yourname/go-tiny-claw/internal/tools"
 )
@@ -31,33 +34,53 @@ func main() {
 
 	workDir, _ := os.Getwd()
 
-	// 课程原版是 provider.NewZhipuOpenAIProvider("glm-4.5-air")，这里换成 DeepSeek；
-	// 两者都是 OpenAI 兼容接口，所以只是换了 base URL / key / 模型名。
-	// 模型可用 DEEPSEEK_MODEL 覆盖（默认 deepseek-chat，换成 deepseek-reasoner 即思考模式）。
+	// 课程原版是 provider.NewZhipuOpenAIProvider("glm-4.5-air")，这里换成 DeepSeek。
 	model := provider.DeepSeekModel("")
 	log.Printf("[Config] DeepSeek base URL = %s, model = %s", provider.DeepSeekBaseURL(), model)
 
 	llmProvider := provider.NewDeepSeekProvider(model)
 
-	// 第 08 章：引擎支持并发执行同一轮里的多个工具调用。
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
 	registry.Register(tools.NewBashTool(workDir))
 	registry.Register(tools.NewEditFileTool(workDir))
 
-	// 课程这里开慢思考来促使模型一次规划出多个并行工具调用；
-	// 但 DeepSeek 在 Phase 1（无工具）会把调用意图吐成 <tool_call>/DSML 文本，
-	// 所以本项目默认关闭，靠 prompt 里「一次性读取」的措辞驱动并发。
+	// 慢思考默认关闭（DeepSeek 在无工具阶段会吐 <tool_call> 文本）。
 	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
 
+	// 有飞书凭证就走 Webhook 服务模式（课程原版行为），否则本地命令行跑一个 demo。
+	if os.Getenv("FEISHU_APP_ID") != "" {
+		runFeishuServer(eng)
+		return
+	}
+
+	runConsoleDemo(eng)
+}
+
+// runFeishuServer 是课程第 09 章的主体：起一个 HTTP 服务接飞书事件回调。
+func runFeishuServer(eng *engine.AgentEngine) {
+	bot := feishu.NewFeishuBot(eng)
+	handler := httpserverext.NewEventHandlerFunc(bot.GetEventDispatcher())
+
+	http.HandleFunc("/webhook/event", handler)
+
+	port := ":48080"
+	log.Printf("🚀 go-tiny-claw 飞书服务端已启动，正在监听 %s 端口\n", port)
+
+	if err := http.ListenAndServe(port, nil); err != nil {
+		log.Fatalf("服务器启动失败: %v", err)
+	}
+}
+
+// runConsoleDemo 没有飞书凭证时的本地路径：同一个 engine + 终端 Reporter。
+func runConsoleDemo(eng *engine.AgentEngine) {
 	prompt := `
 	我当前目录下有 a.txt, b.txt, c.txt 三个文件。(如果没有请忽略找不到的报错)
 	为了节省时间，请你同时一次性利用工具读取这三个文件，并将它们的内容综合起来告诉我。
 	`
 
-	err := eng.Run(context.Background(), prompt)
-	if err != nil {
+	if err := eng.Run(context.Background(), prompt, newConsoleReporter()); err != nil {
 		log.Fatalf("引擎运行崩溃: %v", err)
 	}
 }

@@ -2,7 +2,7 @@
 
 跟着极客时间《从 0 开始构建 Agent Harness》课程，用 Go 手写一个迷你 Agent Harness（对标 Claude Code）。
 
-当前进度：**第 08 章 · 并发执行工具调用**。
+当前进度：**第 09 章 · Reporter 抽象与飞书接入**。
 
 ## 章节进度
 
@@ -16,6 +16,7 @@
 | 06 | 工具集补齐：`write_file` + `bash`，Agent 能真改文件、真跑命令 | ✅（Windows 适配） |
 | 07 | `edit_file`：按 old_text 做局部替换，四层模糊匹配兜底 | ✅ |
 | 08 | 同一轮里的多个工具调用改并发执行（goroutine + WaitGroup） | ✅ |
+| 09 | `Reporter` 抽象 + 飞书机器人接入（Webhook 服务） | ✅（另加终端 Reporter） |
 
 ## 第 01 章 · 工程骨架
 
@@ -187,6 +188,54 @@ for _, obs := range observationMsgs {                // 严格按原始顺序回
 本项目**没开**，只在 prompt 里写「同时一次性读取这三个文件」，DeepSeek 就直接吐出了 3 个并行调用 ——
 说明这个行为主要靠提示词驱动，不是非得靠两阶段 hack。
 
+## 第 09 章 · Reporter 抽象与飞书接入
+
+前几章 engine 直接 `fmt.Printf` 往终端打日志。这一章把「展示」抽成接口：
+
+```go
+type Reporter interface {
+    OnThinking(ctx context.Context)
+    OnToolCall(ctx context.Context, toolName string, args string)
+    OnToolResult(ctx context.Context, toolName string, result string, isError bool)
+    OnMessage(ctx context.Context, content string)
+}
+```
+
+`Run(ctx, prompt, reporter)` 多收一个 reporter，engine 只负责**在正确时机回调**，不再关心输出到哪：
+
+| 实现 | 文件 | 用途 |
+| --- | --- | --- |
+| `FeishuReporter` | `internal/feishu/bot.go` | 把过程推送到飞书群，人不在电脑前也能看 Agent 干活 |
+| `consoleReporter` | `cmd/claw/console_reporter.go` | **本项目补的**，没飞书凭证时本地调试用 |
+
+飞书侧是一个标准 Webhook 服务：`http.HandleFunc("/webhook/event", ...)` 监听 `:48080`，
+收到 `P2MessageReceiveV1`（用户发消息）就 `go b.handleAgentRun(...)` 丢给 engine，
+engine 的每个回调再通过飞书 OpenAPI 发消息回群。
+
+> 注意 `handleAgentRun` 用了 `go`：飞书要求 3 秒内响应事件回调，所以必须异步跑 Agent，
+> 否则会超时重推。这是接入 IM 时最容易踩的坑之一。
+
+### 本项目的入口设计
+
+课程 `main.go` 直接把 CLI demo 换成了飞书服务端。本项目做成了双模式，方便没有飞书凭证时也能跑：
+
+```go
+if os.Getenv("FEISHU_APP_ID") != "" {
+    runFeishuServer(eng)   // 课程原版：起 webhook 服务
+    return
+}
+runConsoleDemo(eng)        // 本地：同一个 engine + 终端 Reporter
+```
+
+要接飞书，在 `.env` 里补四个变量即可：
+
+```
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_VERIFY_TOKEN=xxx
+FEISHU_ENCRYPT_KEY=xxx
+```
+
 ## 目录结构
 
 ```
@@ -195,23 +244,19 @@ go-tiny-claw/
 ├── hello.txt                     # read_file 的测试文本（第 05 章）
 ├── server.go                     # edit_file 的测试文件（第 07 章）
 ├── a.txt / b.txt / c.txt         # 并发读的测试文本（第 08 章）
-├── go.mod / go.sum               # 带 anthropic-sdk-go、openai-go/v3 依赖
-├── cmd/claw/main.go              # 用 DeepSeek Provider + 四件套工具驱动循环
+├── go.mod / go.sum               # 新增 larksuite/oapi-sdk-go/v3（飞书 SDK）
+├── cmd/claw/
+│   ├── main.go                   # 双模式入口：飞书服务 / 本地 CLI
+│   └── console_reporter.go       # 终端 Reporter（本项目新增）
 └── internal/
     ├── config/dotenv.go          # 极简 .env 加载器（本项目新增，无第三方依赖）
-    ├── engine/loop.go            # 两阶段 ReAct 循环 + 并发工具执行
-    ├── provider/
-    │   ├── interface.go          # LLMProvider 接口
-    │   ├── claude.go             # Anthropic 实现（课程原版，未被调用）
-    │   ├── openai.go             # OpenAI 兼容实现（课程原版 + 智谱构造器）
-    │   └── deepseek.go           # DeepSeek 构造器（本项目新增）
+    ├── engine/
+    │   ├── loop.go               # ReAct 循环 + 并发工具执行 + Reporter 回调
+    │   └── reporter.go           # Reporter 接口
+    ├── feishu/bot.go             # 飞书机器人 + FeishuReporter
+    ├── provider/                 # LLMProvider 接口 + claude/openai/deepseek
     ├── schema/message.go
-    └── tools/
-        ├── registry.go           # BaseTool / Registry / registryImpl
-        ├── read_file.go          # 读文件
-        ├── write_file.go         # 写文件
-        ├── bash.go               # 执行命令（Windows 走 cmd.exe）
-        └── edit_file.go          # 局部替换 + 四层模糊匹配
+    └── tools/                    # registry + read/write/bash/edit 四件套
 ```
 
 ## 运行
@@ -262,25 +307,23 @@ go vet ./...
 go run ./cmd/claw
 ```
 
-预期：模型一次吐出 3 个 `read_file` 调用，Harness 并发执行，再按序把结果回填后综合（两轮）：
+预期：模型一次吐出 3 个 `read_file` 调用，Harness 并发执行，再按序把结果回填后综合（两轮）。
+注意从第 09 章起，终端输出改由 `consoleReporter` 负责（`[Reporter]` 前缀）：
 
 ```
 [Registry] 成功挂载工具: read_file / write_file / bash / edit_file
-========== [Turn 1] 开始 ==========
-[Engine] 模型请求并发调用 3 个工具...
-  -> [Go-2] 🛠️ 触发并行执行: read_file
-  -> [Go-0] 🛠️ 触发并行执行: read_file
-  -> [Go-1] 🛠️ 触发并行执行: read_file
-  -> [Go-1] ✅ 工具执行成功 (返回 62 字节)
-  -> [Go-2] ✅ 工具执行成功 (返回 56 字节)
-  -> [Go-0] ✅ 工具执行成功 (返回 56 字节)
-[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...
-========== [Turn 2] 开始 ==========
-🤖 [对外回复]: 三个文件都成功读取了……（a.txt 前端报错日志 / b.txt 后端响应时间 / c.txt 今天是周五）
-[Engine] 模型未请求调用工具，任务宣告完成。
+[Engine] 引擎启动，锁定工作区: ...
+🤖 [对外回复]: 我将同时读取这三个文件。
+[Reporter] 🛠️ 调用工具: read_file, 参数: {"path": "a.txt"}
+[Reporter] 🛠️ 调用工具: read_file, 参数: {"path": "c.txt"}
+[Reporter] 🛠️ 调用工具: read_file, 参数: {"path": "b.txt"}
+[Reporter] ✅ 成功 (read_file): 这是文件B，里面记录了后端的接口响应时间。
+[Reporter] ✅ 成功 (read_file): 这是文件A，里面记录了前端的报错日志。
+[Reporter] ✅ 成功 (read_file): 这是文件C，里面写着今天的日期是周五。
+🤖 [对外回复]: 三个文件都读取成功，内容综合如下：……
 ```
 
-> 注意 `[Go-N]` 的完成顺序是乱的（谁先跑完谁先打印），但回填进上下文的顺序严格是 0/1/2，
+> 工具回调的**完成顺序是乱的**（谁先跑完谁先打印），但回填进上下文的顺序严格是 a/b/c，
 > 因为 `observationMsgs` 是按下标写的、聚合后才 append。这正是并发实现要保证的东西。
 
 ### Go 版本
@@ -329,5 +372,6 @@ Phase 1 用 `Generate(ctx, history, nil)` 把工具清空，模型只能输出�
 
 ## 下一章
 
-第 09 章开始接「外部入口」：新增 `internal/feishu/bot.go`（飞书机器人）、`internal/engine/reporter.go`
-（把执行过程回报出去），`loop.go` 同时瘦身重构，`go.mod` 也会多出依赖。
+第 10 章进入上下文工程：新增 `internal/context/composer.go`、`internal/context/skill.go`，
+以及 `workspace/AGENTS.md` + `workspace/.claw/skills/git-workflow/SKILL.md` ——
+也就是让 Agent 读取项目约定和「技能」文档，再拼进 system prompt。
