@@ -2,7 +2,7 @@
 
 跟着极客时间《从 0 开始构建 Agent Harness》课程，用 Go 手写一个迷你 Agent Harness（对标 Claude Code）。
 
-当前进度：**第 07 章 · edit_file：局部替换与模糊匹配**。
+当前进度：**第 08 章 · 并发执行工具调用**。
 
 ## 章节进度
 
@@ -15,6 +15,7 @@
 | 05 | 真实工具：`BaseTool` 接口 + 可注册的 Registry + `read_file` | ✅ |
 | 06 | 工具集补齐：`write_file` + `bash`，Agent 能真改文件、真跑命令 | ✅（Windows 适配） |
 | 07 | `edit_file`：按 old_text 做局部替换，四层模糊匹配兜底 | ✅ |
+| 08 | 同一轮里的多个工具调用改并发执行（goroutine + WaitGroup） | ✅ |
 
 ## 第 01 章 · 工程骨架
 
@@ -155,6 +156,37 @@ return exec.CommandContext(ctx, "bash", "-c", command)
 L2 那层在 Windows 上尤其重要：本仓库 `core.autocrlf=true`，检出的文件是 CRLF，
 而模型在 JSON 里写的换行是 `\n`，不归一化就永远匹配不上。
 
+## 第 08 章 · 并发执行工具调用
+
+第 07 章之前，一轮里多个工具调用是**串行**的：读完 a.txt 再读 b.txt。模型其实可以在一次响应里给出多个
+`tool_calls`，Harness 完全可以并行执行它们 —— 这一章就是把 `for` 循环换成 goroutine + WaitGroup：
+
+```go
+observationMsgs := make([]schema.Message, len(actionResp.ToolCalls)) // 预分配，按下标写
+var wg sync.WaitGroup
+for i, call := range actionResp.ToolCalls {
+    wg.Add(1)
+    go func(idx int, c schema.ToolCall) {
+        defer wg.Done()
+        result := e.registry.Execute(ctx, c)          // 并发执行
+        observationMsgs[idx] = schema.Message{...}    // 各写各的下标，无数据竞争
+    }(i, call)
+}
+wg.Wait()                                            // 聚合
+for _, obs := range observationMsgs {                // 严格按原始顺序回填
+    contextHistory = append(contextHistory, obs)
+}
+```
+
+两个设计要点：
+
+1. **预分配切片 + 按下标写**，避免多 goroutine 抢 `append` 造成数据竞争；
+2. **聚合后按原序回填**，保证 `tool_call_id` 与结果的对应关系稳定 —— 模型是靠 id 匹配结果的，顺序乱了它会困惑。
+
+顺带一个观察：课程为了「让模型一次规划出多个并行调用」开了慢思考（`EnableThinking = true`）。
+本项目**没开**，只在 prompt 里写「同时一次性读取这三个文件」，DeepSeek 就直接吐出了 3 个并行调用 ——
+说明这个行为主要靠提示词驱动，不是非得靠两阶段 hack。
+
 ## 目录结构
 
 ```
@@ -162,11 +194,12 @@ go-tiny-claw/
 ├── .env.example                  # 环境变量模板，复制成 .env 使用（.env 已被忽略）
 ├── hello.txt                     # read_file 的测试文本（第 05 章）
 ├── server.go                     # edit_file 的测试文件（第 07 章）
+├── a.txt / b.txt / c.txt         # 并发读的测试文本（第 08 章）
 ├── go.mod / go.sum               # 带 anthropic-sdk-go、openai-go/v3 依赖
 ├── cmd/claw/main.go              # 用 DeepSeek Provider + 四件套工具驱动循环
 └── internal/
     ├── config/dotenv.go          # 极简 .env 加载器（本项目新增，无第三方依赖）
-    ├── engine/loop.go            # 两阶段 ReAct 循环
+    ├── engine/loop.go            # 两阶段 ReAct 循环 + 并发工具执行
     ├── provider/
     │   ├── interface.go          # LLMProvider 接口
     │   ├── claude.go             # Anthropic 实现（课程原版，未被调用）
@@ -229,30 +262,26 @@ go vet ./...
 go run ./cmd/claw
 ```
 
-预期：模型先 `read_file` 看清 `server.go`，再用 `edit_file` 替换 if 块，再 `read_file` 复核，
-最后给出总结（四轮、三次工具调用）：
+预期：模型一次吐出 3 个 `read_file` 调用，Harness 并发执行，再按序把结果回填后综合（两轮）：
 
 ```
-[Registry] 成功挂载工具: read_file
-[Registry] 成功挂载工具: write_file
-[Registry] 成功挂载工具: bash
-[Registry] 成功挂载工具: edit_file
+[Registry] 成功挂载工具: read_file / write_file / bash / edit_file
 ========== [Turn 1] 开始 ==========
-🤖 [对外回复]: 我先读取一下 server.go 文件内容。
-  -> 🛠️ 执行工具: read_file, 参数: {"path": "server.go"}
+[Engine] 模型请求并发调用 3 个工具...
+  -> [Go-2] 🛠️ 触发并行执行: read_file
+  -> [Go-0] 🛠️ 触发并行执行: read_file
+  -> [Go-1] 🛠️ 触发并行执行: read_file
+  -> [Go-1] ✅ 工具执行成功 (返回 62 字节)
+  -> [Go-2] ✅ 工具执行成功 (返回 56 字节)
+  -> [Go-0] ✅ 工具执行成功 (返回 56 字节)
+[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...
 ========== [Turn 2] 开始 ==========
-🤖 [对外回复]: 现在替换那个 if 语句。
-  -> 🛠️ 执行工具: edit_file, 参数: {"path": "server.go", "old_text": "...", "new_text": "..."}
-  -> ✅ 工具执行成功 (返回 33 字节)
-========== [Turn 3] 开始 ==========
-  -> 🛠️ 执行工具: read_file, 参数: {"path": "server.go"}
-========== [Turn 4] 开始 ==========
-🤖 [对外回复]: 已完成替换……（并提醒 user 变量未定义，当前无法编译）
+🤖 [对外回复]: 三个文件都成功读取了……（a.txt 前端报错日志 / b.txt 后端响应时间 / c.txt 今天是周五）
 [Engine] 模型未请求调用工具，任务宣告完成。
 ```
 
-> 这个 demo 会真的改写 `server.go`。跑完想复原：`git checkout -- server.go`。
-> 注意改完的文件引用了未定义的 `user`，`go build ./...` 会失败，这是课程示例的预期结果，不是 bug。
+> 注意 `[Go-N]` 的完成顺序是乱的（谁先跑完谁先打印），但回填进上下文的顺序严格是 0/1/2，
+> 因为 `observationMsgs` 是按下标写的、聚合后才 append。这正是并发实现要保证的东西。
 
 ### Go 版本
 
@@ -300,5 +329,5 @@ Phase 1 用 `Generate(ctx, history, nil)` 把工具清空，模型只能输出�
 
 ## 下一章
 
-第 08 章开始动 engine 核心：`loop.go` 会从 3118 字节涨到 3571 字节（引出上下文/轮次控制），
-同时新增 `a.txt`、`b.txt`、`c.txt` 三个夹具文件配合演示。
+第 09 章开始接「外部入口」：新增 `internal/feishu/bot.go`（飞书机器人）、`internal/engine/reporter.go`
+（把执行过程回报出去），`loop.go` 同时瘦身重构，`go.mod` 也会多出依赖。
